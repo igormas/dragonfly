@@ -104,6 +104,39 @@ std::error_code OpManager::PrepareAndStash(PendingId id, size_t length,
   return {};
 }
 
+io::Result<DiskSegment> OpManager::DirectStash(
+    size_t length, const std::function<size_t(io::MutableBytes)>& writer) {
+  auto buf = storage_.PrepareStash(length);
+  if (!buf)
+    return nonstd::make_unexpected(buf.error());
+
+  size_t written = writer(buf->second.bytes);
+  DiskSegment segment{buf->first, written};
+
+  storage_.Stash(segment, buf->second, [segment](std::error_code ec) {
+    LOG_IF(ERROR, ec) << "Direct stash failed for segment " << segment;
+  });
+
+  return segment;
+}
+
+void OpManager::DirectRead(DiskSegment segment, DiskStorage::ReadCb cb) {
+  DiskSegment aligned = segment.ContainingPages();
+  storage_.Read(aligned,
+                [cb = std::move(cb), segment, aligned](io::Result<std::string_view> result) {
+                  if (result) {
+                    size_t page_offset = segment.offset - aligned.offset;
+                    cb(result->substr(page_offset, segment.length));
+                  } else {
+                    cb(result);
+                  }
+                });
+}
+
+void OpManager::DirectFree(DiskSegment segment) {
+  storage_.MarkAsFree(segment.ContainingPages());
+}
+
 OpManager::ReadOp& OpManager::PrepareRead(DiskSegment aligned_segment) {
   DCHECK_EQ(aligned_segment.offset % kPageSize, 0u);
   DCHECK_EQ(aligned_segment.length % kPageSize, 0u);

@@ -3,6 +3,7 @@
 //
 extern "C" {
 #include "redis/sds.h"
+#include "redis/zmalloc.h"
 }
 
 #include <absl/functional/overload.h>
@@ -23,6 +24,7 @@ extern "C" {
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/family_utils.h"
+#include "server/tiered_storage.h"
 #include "server/transaction.h"
 
 /**
@@ -299,6 +301,20 @@ ListWrapper GetLW(const PrimeValue& mv) {
   return ListWrapper{detail::ListPack(static_cast<uint8_t*>(mv.RObjPtr()))};
 }
 
+// Sets up the QList tiering callbacks that delegate to TieredStorage for disk I/O.
+// This is a no-op if tiering_params are not configured or callbacks are already set.
+void EnsureListTieringCallbacks(QList* ql, TieredStorage* ts) {
+  ts->SetupListTieringCallbacks(ql);
+}
+
+// Convenience wrapper: sets up tiering callbacks on a PrimeValue if it holds a QList.
+void EnsureListTiering(const PrimeValue& pv, TieredStorage* ts) {
+  if (!ts || pv.Encoding() != kEncodingQL2)
+    return;
+  auto* ql = static_cast<QList*>(pv.RObjPtr());
+  EnsureListTieringCallbacks(ql, ts);
+}
+
 enum class ListDir : uint8_t { LEFT, RIGHT };
 
 QList::Where ToWhere(ListDir dir) {
@@ -338,6 +354,7 @@ std::string OpBPop(Transaction* t, EngineShard* shard, std::string_view key, Lis
   std::string value;
   size_t len;
 
+  EnsureListTiering(it->second, shard->tiered_storage());
   ListWrapper lw = GetLW(it->second);
   QList::Where where = ToWhere(dir);
   value = lw.Pop(where);
@@ -384,6 +401,7 @@ OpResult<string> OpMoveSingleShard(const OpArgs& op_args, string_view src, strin
 
   auto src_it = src_res->it;
   string val;
+  EnsureListTiering(src_it->second, op_args.shard->tiered_storage());
   ListWrapper srcql_v2 = GetLW(src_it->second);
   size_t prev_len = srcql_v2.Size();
 
@@ -405,12 +423,14 @@ OpResult<string> OpMoveSingleShard(const OpArgs& op_args, string_view src, strin
   src_it = src_res->it;
 
   ListWrapper dest_lw = CreateOrGet(op_args, dest, dest_res.is_new, &dest_res.it->second);
+  EnsureListTiering(dest_res.it->second, op_args.shard->tiered_storage());
 
   val = srcql_v2.Pop(ToWhere(src_dir));
   srcql_v2.Launder(&src_it->second);
 
   dest_lw.Push(val, ToWhere(dest_dir));
   dest_lw.Launder(&dest_res.it->second);
+  EnsureListTiering(dest_res.it->second, op_args.shard->tiered_storage());
 
   src_res->post_updater.Run();
   dest_res.post_updater.Run();
@@ -436,6 +456,7 @@ OpResult<string> Peek(const OpArgs& op_args, string_view key, ListDir dir, bool 
   const PrimeValue& pv = it_res.value()->second;
   DCHECK_GT(pv.Size(), 0u);  // should be not-empty.
 
+  EnsureListTiering(pv, op_args.shard->tiered_storage());
   ListWrapper lw = GetLW(pv);
   return lw.First(ToWhere(dir));
 }
@@ -459,12 +480,15 @@ OpResult<uint32_t> OpPush(const OpArgs& op_args, std::string_view key, ListDir d
   size_t len = 0;
   DVLOG(1) << "OpPush " << key << " new_key " << res.is_new;
   ListWrapper lw = CreateOrGet(op_args, key, res.is_new, &res.it->second);
+  EnsureListTiering(res.it->second, op_args.shard->tiered_storage());
 
   QList::Where where = ToWhere(dir);
   for (string_view v : vals) {
     lw.Push(v, where);
   }
   lw.Launder(&res.it->second);
+  // After Launder, the encoding may have been promoted from LP to QList.
+  EnsureListTiering(res.it->second, op_args.shard->tiered_storage());
   len = lw.Size();
 
   if (journal_rewrite && op_args.shard->journal()) {
@@ -492,6 +516,7 @@ OpResult<StringVec> OpPop(const OpArgs& op_args, string_view key, ListDir dir, u
   size_t prev_len = 0;
   StringVec res;
 
+  EnsureListTiering(it->second, op_args.shard->tiered_storage());
   ListWrapper lw = GetLW(it->second);
   prev_len = lw.Size();
 
@@ -605,6 +630,7 @@ OpResult<string> OpIndex(const OpArgs& op_args, std::string_view key, long index
   if (!res)
     return res.status();
 
+  EnsureListTiering(res.value()->second, op_args.shard->tiered_storage());
   ListWrapper lw = GetLW(res.value()->second);
   optional elem = lw.At(index);
   if (!elem)
@@ -622,6 +648,7 @@ OpResult<vector<uint32_t>> OpPos(const OpArgs& op_args, string_view key, string_
     return it_res.status();
 
   const PrimeValue& pv = (*it_res)->second;
+  EnsureListTiering(pv, op_args.shard->tiered_storage());
   ListWrapper lw = GetLW(pv);
 
   QList::Where where = QList::HEAD;
@@ -642,12 +669,14 @@ OpResult<int> OpInsert(const OpArgs& op_args, string_view key, string_view pivot
   if (!it_res)
     return it_res.status();
 
+  EnsureListTiering(it_res->it->second, op_args.shard->tiered_storage());
   ListWrapper lw = GetLW(it_res->it->second);
 
   int res = -1;
 
   if (lw.Insert(pivot, elem, insert_opt)) {
     lw.Launder(&it_res->it->second);
+    EnsureListTiering(it_res->it->second, op_args.shard->tiered_storage());
     res = int(lw.Size());
   }
 
@@ -660,6 +689,7 @@ OpResult<uint32_t> OpRem(const OpArgs& op_args, string_view key, string_view ele
   if (!it_res)
     return it_res.status();
 
+  EnsureListTiering(it_res->it->second, op_args.shard->tiered_storage());
   ListWrapper lw = GetLW(it_res->it->second);
 
   QList::Where where = QList::HEAD;
@@ -686,6 +716,7 @@ OpStatus OpSet(const OpArgs& op_args, string_view key, string_view elem, long in
   if (!it_res)
     return it_res.status();
 
+  EnsureListTiering(it_res->it->second, op_args.shard->tiered_storage());
   ListWrapper lw = GetLW(it_res->it->second);
   OpStatus status = OpStatus::OUT_OF_RANGE;
   if (lw.Replace(index, elem)) {
@@ -728,6 +759,7 @@ OpStatus OpTrim(const OpArgs& op_args, string_view key, long start, long end) {
     rtrim = llen - end - 1;
   }
 
+  EnsureListTiering(it->second, op_args.shard->tiered_storage());
   ListWrapper lw = GetLW(it->second);
   lw.Erase(0, ltrim);
   lw.Erase(-rtrim, rtrim);
@@ -747,6 +779,7 @@ OpResult<StringVec> OpRange(const OpArgs& op_args, std::string_view key, long st
     return res.status();
 
   const PrimeValue& pv = (*res)->second;
+  EnsureListTiering(pv, op_args.shard->tiered_storage());
   long llen = pv.Size();
 
   /* convert negative indexes */

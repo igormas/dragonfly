@@ -10,6 +10,7 @@
 #include "base/cycle_clock.h"
 #include "base/flags.h"
 #include "base/logging.h"
+#include "core/qlist.h"
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/journal.h"
@@ -385,6 +386,18 @@ void SliceSnapshot::SerializeEntry(DbIndex db_indx, const PrimeKey& pk, const Pr
     }
   }
   uint32_t mc_flags = pv.HasFlag() ? db_slice_->GetMCFlag(db_indx, pk) : 0;
+
+  // Load offloaded list nodes before serialization.
+  if (pv.ObjType() == OBJ_LIST && pv.Encoding() == kEncodingQL2) {
+    QList* ql = static_cast<QList*>(pv.RObjPtr());
+    if (ql->num_offloaded_nodes() > 0) {
+      TieredStorage* ts = EngineShard::tlocal()->tiered_storage();
+      if (ts) {
+        ts->SetupListTieringCallbacks(ql);
+      }
+      ql->LoadAllOffloaded();
+    }
+  }
 
   if (pv.IsExternal()) {
     // TODO: we loose the stickiness attribute by cloning like this PrimeKey.

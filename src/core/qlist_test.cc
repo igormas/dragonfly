@@ -10,6 +10,8 @@
 #include <gmock/gmock.h>
 #include <mimalloc.h>
 
+#include <unordered_map>
+
 #include "base/gtest.h"
 #include "base/logging.h"
 #include "core/mi_memory_resource.h"
@@ -416,6 +418,270 @@ TEST_F(QListTest, Tiering) {
     ql_.Push(absl::StrCat("value", i), QList::TAIL);
   }
   EXPECT_EQ(QList::stats.offload_requests, 9);
+}
+
+struct MockDisk {
+  size_t next_offset = 1;  // 0 is reserved
+  unordered_map<size_t, string> storage;
+  size_t delete_count = 0;
+
+  pair<size_t, size_t> Write(const void* data, size_t len) {
+    size_t off = next_offset++;
+    storage[off] = string(static_cast<const char*>(data), len);
+    return {off, len};
+  }
+
+  string Read(size_t offset, size_t length) {
+    auto it = storage.find(offset);
+    DCHECK(it != storage.end());
+    DCHECK_EQ(it->second.size(), length);
+    return it->second;
+  }
+
+  void Delete(size_t offset, size_t length) {
+    storage.erase(offset);
+    delete_count++;
+  }
+};
+
+TEST_F(QListTest, TieringWithCallbacks) {
+  MockDisk disk;
+  const int kNumElements = 20;
+
+  // fill=1 so each element gets its own node, compress=0 for simplicity.
+  ql_ = QList(1, 0);
+
+  auto offload_cb = [&disk](QList::Node* node) -> bool {
+    auto [offset, length] = disk.Write(node->entry, node->sz);
+    zfree(node->entry);
+    node->SetDiskSegment(offset, length);
+    node->offloaded = 1;
+    return true;
+  };
+
+  auto onload_cb = [&disk](QList::Node* node) {
+    string data = disk.Read(node->DiskOffset(), node->DiskLength());
+    node->entry = (unsigned char*)zmalloc(data.size());
+    memcpy(node->entry, data.data(), data.size());
+    node->sz = data.size();
+    node->offloaded = 0;
+  };
+
+  auto delete_offloaded_cb = [&disk](size_t offset, size_t length) {
+    disk.Delete(offset, length);
+  };
+
+  ql_.SetTieringParams(QList::TieringParams{
+      .node_depth_threshold = 1,
+      .offload_cb = offload_cb,
+      .onload_cb = onload_cb,
+      .delete_offloaded_cb = delete_offloaded_cb,
+  });
+
+  for (int i = 0; i < kNumElements; i++) {
+    ql_.Push(StrCat("value", i), QList::TAIL);
+  }
+
+  // With fill=1, each push creates a new node, interior ones should be offloaded.
+  EXPECT_GT(ql_.num_offloaded_nodes(), 0u);
+  EXPECT_FALSE(disk.storage.empty());
+  EXPECT_EQ(ql_.Size(), unsigned(kNumElements));
+
+  // Iterate all elements - should on-load offloaded nodes and return correct data.
+  vector<string> items;
+  ql_.Iterate(
+      [&](const QList::Entry& e) {
+        items.push_back(e.to_string());
+        return true;
+      },
+      0, ql_.Size());
+
+  ASSERT_EQ(items.size(), size_t(kNumElements));
+  for (int i = 0; i < kNumElements; i++) {
+    EXPECT_EQ(items[i], StrCat("value", i));
+  }
+}
+
+TEST_F(QListTest, TieringDeleteOffloaded) {
+  MockDisk disk;
+  const int kNumElements = 20;
+
+  ql_ = QList(1, 0);
+
+  auto offload_cb = [&disk](QList::Node* node) -> bool {
+    auto [offset, length] = disk.Write(node->entry, node->sz);
+    zfree(node->entry);
+    node->SetDiskSegment(offset, length);
+    node->offloaded = 1;
+    return true;
+  };
+
+  auto onload_cb = [&disk](QList::Node* node) {
+    string data = disk.Read(node->DiskOffset(), node->DiskLength());
+    node->entry = (unsigned char*)zmalloc(data.size());
+    memcpy(node->entry, data.data(), data.size());
+    node->sz = data.size();
+    node->offloaded = 0;
+  };
+
+  auto delete_offloaded_cb = [&disk](size_t offset, size_t length) {
+    disk.Delete(offset, length);
+  };
+
+  ql_.SetTieringParams(QList::TieringParams{
+      .node_depth_threshold = 1,
+      .offload_cb = offload_cb,
+      .onload_cb = onload_cb,
+      .delete_offloaded_cb = delete_offloaded_cb,
+  });
+
+  for (int i = 0; i < kNumElements; i++) {
+    ql_.Push(StrCat("value", i), QList::TAIL);
+  }
+
+  uint32_t offloaded_before = ql_.num_offloaded_nodes();
+  ASSERT_GT(offloaded_before, 0u);
+  size_t disk_entries_before = disk.storage.size();
+  ASSERT_GT(disk_entries_before, 0u);
+
+  // Clear should call delete_offloaded_cb for all offloaded nodes.
+  ql_.Clear();
+
+  EXPECT_EQ(disk.delete_count, offloaded_before);
+  EXPECT_TRUE(disk.storage.empty());
+  EXPECT_EQ(ql_.Size(), 0u);
+  EXPECT_EQ(ql_.num_offloaded_nodes(), 0u);
+}
+
+TEST_F(QListTest, TieringTriggerOffloading) {
+  MockDisk disk;
+  const int kNumElements = 20;
+
+  // Create list without tiering params first.
+  ql_ = QList(1, 0);
+  for (int i = 0; i < kNumElements; i++) {
+    ql_.Push(StrCat("value", i), QList::TAIL);
+  }
+
+  // No offloading should have happened.
+  ASSERT_EQ(ql_.num_offloaded_nodes(), 0u);
+
+  // Now set tiering params with real callbacks and trigger offloading.
+  auto offload_cb = [&disk](QList::Node* node) -> bool {
+    auto [offset, length] = disk.Write(node->entry, node->sz);
+    zfree(node->entry);
+    node->SetDiskSegment(offset, length);
+    node->offloaded = 1;
+    return true;
+  };
+
+  auto onload_cb = [&disk](QList::Node* node) {
+    string data = disk.Read(node->DiskOffset(), node->DiskLength());
+    node->entry = (unsigned char*)zmalloc(data.size());
+    memcpy(node->entry, data.data(), data.size());
+    node->sz = data.size();
+    node->offloaded = 0;
+  };
+
+  auto delete_offloaded_cb = [&disk](size_t offset, size_t length) {
+    disk.Delete(offset, length);
+  };
+
+  ql_.SetTieringParams(QList::TieringParams{
+      .node_depth_threshold = 1,
+      .offload_cb = offload_cb,
+      .onload_cb = onload_cb,
+      .delete_offloaded_cb = delete_offloaded_cb,
+  });
+
+  ql_.TriggerOffloading();
+
+  // Interior nodes should now be offloaded.
+  EXPECT_GT(ql_.num_offloaded_nodes(), 0u);
+  EXPECT_FALSE(disk.storage.empty());
+
+  // Verify all elements are still readable after offloading.
+  vector<string> items;
+  ql_.Iterate(
+      [&](const QList::Entry& e) {
+        items.push_back(e.to_string());
+        return true;
+      },
+      0, ql_.Size());
+
+  ASSERT_EQ(items.size(), size_t(kNumElements));
+  for (int i = 0; i < kNumElements; i++) {
+    EXPECT_EQ(items[i], StrCat("value", i));
+  }
+}
+
+TEST_F(QListTest, TieringEraseRange) {
+  MockDisk disk;
+  const int kNumElements = 20;
+
+  ql_ = QList(1, 0);
+
+  auto offload_cb = [&disk](QList::Node* node) -> bool {
+    auto [offset, length] = disk.Write(node->entry, node->sz);
+    zfree(node->entry);
+    node->SetDiskSegment(offset, length);
+    node->offloaded = 1;
+    return true;
+  };
+
+  auto onload_cb = [&disk](QList::Node* node) {
+    string data = disk.Read(node->DiskOffset(), node->DiskLength());
+    node->entry = (unsigned char*)zmalloc(data.size());
+    memcpy(node->entry, data.data(), data.size());
+    node->sz = data.size();
+    node->offloaded = 0;
+  };
+
+  auto delete_offloaded_cb = [&disk](size_t offset, size_t length) {
+    disk.Delete(offset, length);
+  };
+
+  ql_.SetTieringParams(QList::TieringParams{
+      .node_depth_threshold = 1,
+      .offload_cb = offload_cb,
+      .onload_cb = onload_cb,
+      .delete_offloaded_cb = delete_offloaded_cb,
+  });
+
+  for (int i = 0; i < kNumElements; i++) {
+    ql_.Push(StrCat("value", i), QList::TAIL);
+  }
+
+  uint32_t offloaded_before = ql_.num_offloaded_nodes();
+  ASSERT_GT(offloaded_before, 0u);
+  size_t disk_entries_before = disk.storage.size();
+
+  // Erase a range in the middle that includes offloaded nodes.
+  ql_.Erase(5, 10);
+
+  // Verify the list size decreased and delete_offloaded_cb was called for erased offloaded nodes.
+  EXPECT_EQ(ql_.Size(), unsigned(kNumElements - 10));
+  EXPECT_GT(disk.delete_count, 0u);
+
+  // disk entries should have decreased by the number of deleted offloaded nodes.
+  EXPECT_LT(disk.storage.size(), disk_entries_before);
+
+  // Verify remaining elements are correct: [value0..value4, value15..value19].
+  vector<string> items;
+  ql_.Iterate(
+      [&](const QList::Entry& e) {
+        items.push_back(e.to_string());
+        return true;
+      },
+      0, ql_.Size());
+
+  ASSERT_EQ(items.size(), size_t(kNumElements - 10));
+  for (int i = 0; i < 5; i++) {
+    EXPECT_EQ(items[i], StrCat("value", i));
+  }
+  for (int i = 5; i < 10; i++) {
+    EXPECT_EQ(items[i], StrCat("value", i + 10));
+  }
 }
 
 using FillCompress = tuple<int, unsigned, QList::COMPR_METHOD>;

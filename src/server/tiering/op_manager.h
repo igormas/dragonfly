@@ -72,6 +72,21 @@ class OpManager {
       PendingId id, size_t length,
       const std::function<size_t /*written*/ (io::MutableBytes)>& writer);
 
+  // Direct disk operations for sub-value offloading (no tracking, no notifications).
+  // Used for list node tiering where individual nodes are offloaded independently.
+
+  // Allocate disk space, write data via writer callback, submit async write.
+  // Returns the allocated DiskSegment immediately (write completes asynchronously).
+  io::Result<DiskSegment> DirectStash(size_t length,
+                                      const std::function<size_t(io::MutableBytes)>& writer);
+
+  // Read raw bytes from a disk segment. Callback is invoked with the data when I/O completes.
+  // The callback receives data scoped to the exact segment (not the full containing page).
+  void DirectRead(DiskSegment segment, DiskStorage::ReadCb cb);
+
+  // Free a disk segment directly without tracking.
+  void DirectFree(DiskSegment segment);
+
   Stats GetStats() const;
 
  protected:

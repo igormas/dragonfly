@@ -3208,6 +3208,9 @@ string ServerFamily::FormatInfoMetrics(const Metrics& m, std::string_view sectio
 
     append("tiered_clients_throttled", m.tiered_stats.clients_throttled);
     append("tiered_total_clients_throttled", m.tiered_stats.total_clients_throttled);
+
+    append("tiered_list_offload_requests", m.qlist_stats.offload_requests);
+    append("tiered_list_onload_requests", m.qlist_stats.onload_requests);
   };
 
   auto add_persistence_info = [&] {

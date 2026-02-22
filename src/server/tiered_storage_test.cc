@@ -29,6 +29,8 @@ ABSL_DECLARE_FLAG(unsigned, tiered_storage_write_depth);
 ABSL_DECLARE_FLAG(bool, tiered_experimental_cooling);
 ABSL_DECLARE_FLAG(uint64_t, registered_buffer_size);
 ABSL_DECLARE_FLAG(bool, tiered_experimental_hash_support);
+ABSL_DECLARE_FLAG(unsigned, list_tiering_threshold);
+ABSL_DECLARE_FLAG(bool, tiered_experimental_list_support);
 
 namespace dfly {
 
@@ -558,6 +560,58 @@ TEST_P(LatentCoolingTSTest, SimpleHash) {
     auto v = string{31, 'x'} + 'f';
     EXPECT_EQ(resp, v);
   }
+}
+
+TEST_P(LatentCoolingTSTest, SimpleList) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_tiered_experimental_list_support, true);
+  absl::SetFlag(&FLAGS_list_tiering_threshold, 2u);
+  // Don't upload whole list values (not supported for lists anyway)
+  absl::SetFlag(&FLAGS_tiered_upload_threshold, 0.0);
+  UpdateFromFlags();
+
+  static constexpr size_t kListLen = 500;
+
+  // Create a list with enough elements to have multiple interior quicklist nodes.
+  // Each element is 100 bytes, and default node size limit is ~8KB,
+  // so we'll get ~12+ nodes, with depth-2 threshold leaving most interior.
+  for (size_t i = 0; i < kListLen; i++) {
+    Run({"RPUSH", "mylist", string(100, char('a' + i % 26))});
+  }
+
+  EXPECT_THAT(Run({"LLEN", "mylist"}), IntArg(kListLen));
+
+  // Wait for background offloading to offload interior nodes.
+  ExpectConditionWithinTimeout([this] {
+    auto metrics = GetMetrics();
+    return metrics.qlist_stats.offload_requests > 0;
+  });
+
+  // Verify basic reads still work (triggers onload for offloaded nodes)
+  auto resp = Run({"LINDEX", "mylist", "0"});
+  EXPECT_EQ(resp, string(100, 'a'));
+
+  resp = Run({"LINDEX", "mylist", "-1"});
+  EXPECT_EQ(resp, string(100, char('a' + (kListLen - 1) % 26)));
+
+  // LRANGE over interior elements (some will be offloaded and need onloading)
+  resp = Run({"LRANGE", "mylist", "200", "205"});
+  ASSERT_THAT(resp, ArrLen(6));
+
+  // LPUSH/RPOP still work (head/tail always in memory)
+  Run({"LPUSH", "mylist", "head_val"});
+  EXPECT_THAT(Run({"LLEN", "mylist"}), IntArg(kListLen + 1));
+
+  resp = Run({"LPOP", "mylist"});
+  EXPECT_EQ(resp, "head_val");
+
+  resp = Run({"RPOP", "mylist"});
+  EXPECT_EQ(resp, string(100, char('a' + (kListLen - 1) % 26)));
+
+  // Verify stats show both offload and onload activity
+  auto metrics = GetMetrics();
+  EXPECT_GT(metrics.qlist_stats.offload_requests, 0u);
+  EXPECT_GT(metrics.qlist_stats.onload_requests, 0u);
 }
 
 }  // namespace dfly

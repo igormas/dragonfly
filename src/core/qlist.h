@@ -7,9 +7,11 @@
 #include <absl/functional/function_ref.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
+#include "base/logging.h"
 #include "core/collection_entry.h"
 
 #define QL_COMP_BITS 16
@@ -73,6 +75,22 @@ class QList {
       return encoding != QUICKLIST_NODE_ENCODING_RAW;
     }
 
+    // When offloaded, entry stores the disk offset and sz stores disk length.
+    size_t DiskOffset() const {
+      DCHECK(offloaded);
+      return reinterpret_cast<size_t>(entry);
+    }
+
+    size_t DiskLength() const {
+      DCHECK(offloaded);
+      return sz;
+    }
+
+    void SetDiskSegment(size_t offset, size_t length) {
+      entry = reinterpret_cast<unsigned char*>(offset);
+      sz = length;
+    }
+
     size_t GetLZF(void** data) const;
   };
 
@@ -104,8 +122,22 @@ class QList {
   enum InsertOpt : uint8_t { BEFORE, AFTER };
 
   struct TieringParams {
-    // TODO: hook functions and params that allow qlist offloading nodes to colder storage.
     uint32_t node_depth_threshold = 2;
+
+    // Offload node data to disk. Returns true if accepted (async write initiated).
+    // On success: caller is responsible for freeing entry, storing disk segment via
+    // SetDiskSegment, and setting offloaded=1.
+    using OffloadCb = std::function<bool(Node* node)>;
+    OffloadCb offload_cb;
+
+    // Load offloaded node data from disk (blocks fiber until complete).
+    // Must restore node->entry and node->sz, and clear node->offloaded.
+    using OnloadCb = std::function<void(Node* node)>;
+    OnloadCb onload_cb;
+
+    // Free disk segment when an offloaded node is deleted without being loaded first.
+    using DeleteOffloadedCb = std::function<void(size_t offset, size_t length)>;
+    DeleteOffloadedCb delete_offloaded_cb;
   };
 
   /**
@@ -229,6 +261,22 @@ class QList {
 
   void SetTieringParams(const TieringParams& params);
 
+  // Walk nodes and offload eligible interior ones.
+  // Useful for background offloading of static lists.
+  void TriggerOffloading();
+
+  // Load all offloaded nodes back to memory. Used before RDB serialization.
+  // Requires onload_cb to be set in tiering_params.
+  void LoadAllOffloaded();
+
+  uint32_t num_offloaded_nodes() const {
+    return num_offloaded_nodes_;
+  }
+
+  const TieringParams* tiering_params() const {
+    return tiering_params_.get();
+  }
+
   struct Stats {
     uint64_t compression_attempts = 0;
 
@@ -292,6 +340,7 @@ class QList {
 
   Node* head_ = nullptr;
   size_t malloc_size_ = 0;    // size of the quicklist struct
+  size_t offloaded_size_ = 0; // total size of offloaded node data (disk length)
   uint32_t count_ = 0;        /* total count of all entries in all listpacks */
   uint32_t len_ = 0;          /* number of quicklistNodes */
   int16_t fill_;              /* fill factor for individual nodes */

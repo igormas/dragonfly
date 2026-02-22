@@ -20,6 +20,7 @@
 namespace dfly {
 
 class DbSlice;
+class QList;
 
 namespace tiering {
 class SmallBins;
@@ -85,6 +86,22 @@ class TieredStorage : public TieredStorageBase {
   // Run offloading loop until i/o device is loaded or all entries were traversed
   void RunOffloading(DbIndex dbid);
 
+  // Sub-value offloading for list nodes.
+  // Stash raw bytes to disk. Returns the DiskSegment on success.
+  // The write is submitted asynchronously but the segment is allocated immediately.
+  io::Result<tiering::DiskSegment> StashNodeBytes(
+      size_t length, const std::function<size_t(io::MutableBytes)>& writer);
+
+  // Read raw bytes from disk. Blocks the fiber until complete. Returns the data as a string.
+  std::string ReadNodeBytes(const tiering::DiskSegment& segment);
+
+  // Free a disk segment used by a list node.
+  void FreeNodeBytes(const tiering::DiskSegment& segment);
+
+  // Wire QList tiering callbacks to use this TieredStorage for disk I/O.
+  // No-op if tiering_params are not configured or callbacks are already set.
+  void SetupListTieringCallbacks(QList* ql);
+
   // Prune cool entries to reach the set memory goal with freed memory
   size_t ReclaimMemory(size_t goal);
 
@@ -135,6 +152,7 @@ class TieredStorage : public TieredStorageBase {
     float offload_threshold;
     float upload_threshold;
     bool experimental_hash_offload;
+    bool experimental_list_offload;
   } config_;
 
   mutable struct {
@@ -248,6 +266,21 @@ class TieredStorage : public TieredStorageBase {
   }
 
   void RunOffloading(DbIndex dbid) {
+  }
+
+  io::Result<tiering::DiskSegment> StashNodeBytes(
+      size_t length, const std::function<size_t(io::MutableBytes)>& writer) {
+    return nonstd::make_unexpected(std::make_error_code(std::errc::not_supported));
+  }
+
+  std::string ReadNodeBytes(const tiering::DiskSegment& segment) {
+    return {};
+  }
+
+  void FreeNodeBytes(const tiering::DiskSegment& segment) {
+  }
+
+  void SetupListTieringCallbacks(QList* ql) {
   }
 
   void UpdateFromFlags() {

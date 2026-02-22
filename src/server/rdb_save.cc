@@ -377,6 +377,7 @@ error_code RdbSerializer::SaveListObject(const PrimeValue& pv) {
 
   DCHECK_EQ(pv.Encoding(), kEncodingQL2);
   QList* ql = reinterpret_cast<QList*>(pv.RObjPtr());
+  DCHECK_EQ(ql->num_offloaded_nodes(), 0u) << "Offloaded list nodes must be loaded before RDB save";
   const QList::Node* node = ql->Head();
   size_t len = ql->node_count();
 

@@ -31,7 +31,10 @@
 
 extern "C" {
 #include "redis/listpack.h"
+#include "redis/zmalloc.h"
 }
+
+#include "core/qlist.h"
 
 using namespace facade;
 
@@ -53,6 +56,7 @@ ABSL_FLAG(float, tiered_upload_threshold, 0.1,
           "Ratio of free memory (free/max memory) below which uploading stops");
 
 ABSL_FLAG(bool, tiered_experimental_hash_support, false, "Experimental hash datatype offloading");
+ABSL_FLAG(bool, tiered_experimental_list_support, false, "Experimental list datatype offloading");
 
 namespace dfly {
 
@@ -471,6 +475,66 @@ void TieredStorage::Delete(DbIndex dbid, PrimeValue* value) {
   op_manager_->DeleteOffloaded(dbid, segment);
 }
 
+io::Result<tiering::DiskSegment> TieredStorage::StashNodeBytes(
+    size_t length, const std::function<size_t(io::MutableBytes)>& writer) {
+  return op_manager_->DirectStash(length, writer);
+}
+
+std::string TieredStorage::ReadNodeBytes(const tiering::DiskSegment& segment) {
+  // Must copy data inside the callback because the underlying DiskStorage buffer
+  // is freed (ReturnBuf) after the callback returns but before the waiting fiber runs.
+  util::fb2::Future<std::string> future;
+  op_manager_->DirectRead(segment, [&future](io::Result<std::string_view> result) {
+    CHECK(result) << "Failed to read node bytes: " << result.error().message();
+    future.Resolve(std::string(*result));
+  });
+  return future.Get();
+}
+
+void TieredStorage::FreeNodeBytes(const tiering::DiskSegment& segment) {
+  op_manager_->DirectFree(segment);
+}
+
+void TieredStorage::SetupListTieringCallbacks(QList* ql) {
+  if (!ql->tiering_params() || ql->tiering_params()->offload_cb)
+    return;
+
+  QList::TieringParams params = *ql->tiering_params();
+
+  params.offload_cb = [this](QList::Node* node) -> bool {
+    size_t data_len = node->sz;
+    auto writer = [node](io::MutableBytes buf) -> size_t {
+      memcpy(buf.data(), node->entry, node->sz);
+      return node->sz;
+    };
+    auto result = StashNodeBytes(data_len, writer);
+    if (!result) {
+      VLOG(1) << "List node offload failed: " << result.error().message();
+      return false;
+    }
+    zfree(node->entry);
+    node->SetDiskSegment(result->offset, result->length);
+    node->offloaded = 1;
+    return true;
+  };
+
+  params.onload_cb = [this](QList::Node* node) {
+    tiering::DiskSegment segment{node->DiskOffset(), node->DiskLength()};
+    std::string data = ReadNodeBytes(segment);
+    node->entry = static_cast<unsigned char*>(zmalloc(data.size()));
+    memcpy(node->entry, data.data(), data.size());
+    node->sz = data.size();
+    node->offloaded = 0;
+    FreeNodeBytes(segment);
+  };
+
+  params.delete_offloaded_cb = [this](size_t offset, size_t length) {
+    FreeNodeBytes(tiering::DiskSegment{offset, length});
+  };
+
+  ql->SetTieringParams(params);
+}
+
 void TieredStorage::CancelStash(DbIndex dbid, std::string_view key, PrimeValue* value) {
   DCHECK(value->HasStashPending());
 
@@ -542,13 +606,15 @@ void TieredStorage::UpdateFromFlags() {
       .offload_threshold = absl::GetFlag(FLAGS_tiered_offload_threshold),
       .upload_threshold = absl::GetFlag(FLAGS_tiered_upload_threshold),
       .experimental_hash_offload = absl::GetFlag(FLAGS_tiered_experimental_hash_support),
+      .experimental_list_offload = absl::GetFlag(FLAGS_tiered_experimental_list_support),
   };
 }
 
 std::vector<std::string> TieredStorage::GetMutableFlagNames() {
   return base::GetFlagNames(FLAGS_tiered_min_value_size, FLAGS_tiered_experimental_cooling,
                             FLAGS_tiered_storage_write_depth, FLAGS_tiered_offload_threshold,
-                            FLAGS_tiered_upload_threshold, FLAGS_tiered_experimental_hash_support);
+                            FLAGS_tiered_upload_threshold, FLAGS_tiered_experimental_hash_support,
+                            FLAGS_tiered_experimental_list_support);
 }
 
 bool TieredStorage::ShouldOffload() const {
@@ -587,6 +653,16 @@ void TieredStorage::RunOffloading(DbIndex dbid) {
         stats_.offloading_stashes++;
         it->second.SetStashPending(true);
         Stash(dbid, it->first.GetSlice(&tmp), *blobs, false);
+      }
+    }
+
+    // Handle list node offloading
+    if (config_.experimental_list_offload &&
+        it->second.ObjType() == OBJ_LIST && it->second.Encoding() == kEncodingQL2) {
+      auto* ql = static_cast<QList*>(it->second.RObjPtr());
+      if (ql->tiering_params() && !it->second.WasTouched()) {
+        SetupListTieringCallbacks(ql);
+        ql->TriggerOffloading();
       }
     }
   };

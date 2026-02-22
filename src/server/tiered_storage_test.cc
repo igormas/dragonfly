@@ -579,7 +579,7 @@ TEST_P(LatentCoolingTSTest, SimpleList) {
     Run({"RPUSH", "mylist", string(100, char('a' + i % 26))});
   }
 
-  EXPECT_EQ(Run({"LLEN", "mylist"}), IntArg(kListLen));
+  EXPECT_THAT(Run({"LLEN", "mylist"}), IntArg(kListLen));
 
   // Wait for background offloading to offload interior nodes.
   ExpectConditionWithinTimeout([this] {
@@ -600,7 +600,7 @@ TEST_P(LatentCoolingTSTest, SimpleList) {
 
   // LPUSH/RPOP still work (head/tail always in memory)
   Run({"LPUSH", "mylist", "head_val"});
-  EXPECT_EQ(Run({"LLEN", "mylist"}), IntArg(kListLen + 1));
+  EXPECT_THAT(Run({"LLEN", "mylist"}), IntArg(kListLen + 1));
 
   resp = Run({"LPOP", "mylist"});
   EXPECT_EQ(resp, "head_val");

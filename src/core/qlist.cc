@@ -48,7 +48,7 @@ namespace dfly {
 
 namespace {
 
-static_assert(sizeof(QList) == 48);
+static_assert(sizeof(QList) == 56);
 static_assert(sizeof(QList::Node) == 40);
 
 enum IterDir : uint8_t { FWD = 1, REV = 0 };
@@ -529,6 +529,7 @@ QList::QList(int fill, int compress) : fill_(fill), compress_(compress), bookmar
 QList::QList(QList&& other) noexcept
     : head_(other.head_),
       malloc_size_(other.malloc_size_),
+      offloaded_size_(other.offloaded_size_),
       count_(other.count_),
       len_(other.len_),
       fill_(other.fill_),
@@ -538,6 +539,7 @@ QList::QList(QList&& other) noexcept
       tiering_params_(std::move(other.tiering_params_)) {
   other.head_ = nullptr;
   other.malloc_size_ = 0;
+  other.offloaded_size_ = 0;
   other.len_ = other.count_ = other.num_offloaded_nodes_ = 0;
 }
 
@@ -550,6 +552,7 @@ QList& QList::operator=(QList&& other) noexcept {
     Clear();
     head_ = other.head_;
     malloc_size_ = other.malloc_size_;
+    offloaded_size_ = other.offloaded_size_;
     len_ = other.len_;
     count_ = other.count_;
     fill_ = other.fill_;
@@ -559,6 +562,7 @@ QList& QList::operator=(QList&& other) noexcept {
     num_offloaded_nodes_ = other.num_offloaded_nodes_;
     other.head_ = nullptr;
     other.malloc_size_ = 0;
+    other.offloaded_size_ = 0;
     other.len_ = other.count_ = other.num_offloaded_nodes_ = 0;
   }
   return *this;
@@ -593,6 +597,7 @@ void QList::Clear() noexcept {
   head_ = nullptr;
   count_ = 0;
   malloc_size_ = 0;
+  offloaded_size_ = 0;
   num_offloaded_nodes_ = 0;
 }
 
@@ -717,10 +722,10 @@ size_t QList::MallocUsed(bool slow) const {
         node_size += zmalloc_usable_size(node->entry);
       }
     }
-    return node_size;
+    return node_size + offloaded_size_;
   }
 
-  return node_size + malloc_size_;
+  return node_size + malloc_size_ + offloaded_size_;
 }
 
 void QList::Iterate(IterateFunc cb, long start, long end) const {
@@ -1070,6 +1075,7 @@ void QList::AccessForReads(bool recompress, Node* node) {
       // Callback restored entry, sz, and cleared offloaded
       DCHECK(!node->offloaded);
       malloc_size_ += node->sz;  // Re-add to malloc tracking
+      offloaded_size_ -= node->sz;
     } else {
       // Dry-run fallback
       node->offloaded = 0;
@@ -1204,6 +1210,7 @@ void QList::DelNode(Node* node) {
 
   if (real_offload) {
     num_offloaded_nodes_--;
+    offloaded_size_ -= node->sz;  // sz holds disk length for offloaded nodes
     if (tiering_params_->delete_offloaded_cb) {
       tiering_params_->delete_offloaded_cb(node->DiskOffset(), node->DiskLength());
     }
@@ -1264,6 +1271,7 @@ void QList::OffloadNode(Node* node) {
       // Callback handled: freed original entry, stored disk segment, set offloaded=1
       num_offloaded_nodes_++;
       malloc_size_ -= prev_sz;
+      offloaded_size_ += prev_sz;
     }
     return;
   }

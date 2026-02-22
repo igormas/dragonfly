@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 
+#include "base/logging.h"
 #include "core/collection_entry.h"
 
 #define QL_COMP_BITS 16
@@ -339,6 +340,7 @@ class QList {
 
   Node* head_ = nullptr;
   size_t malloc_size_ = 0;    // size of the quicklist struct
+  size_t offloaded_size_ = 0; // total size of offloaded node data (disk length)
   uint32_t count_ = 0;        /* total count of all entries in all listpacks */
   uint32_t len_ = 0;          /* number of quicklistNodes */
   int16_t fill_;              /* fill factor for individual nodes */
